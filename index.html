@@ -197,9 +197,29 @@ const AudioFX = {
     if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
     try {
       this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // Kompressor: verklebt die Schichten und lässt Booms fett klingen ohne Übersteuern
+      const comp = this.ctx.createDynamicsCompressor();
+      comp.threshold.value = -18;
+      comp.knee.value = 12;
+      comp.ratio.value = 5;
+      comp.attack.value = 0.003;
+      comp.release.value = 0.25;
+      comp.connect(this.ctx.destination);
       this.master = this.ctx.createGain();
-      this.master.gain.value = 0.5;
-      this.master.connect(this.ctx.destination);
+      this.master.gain.value = 0.55;
+      this.master.connect(comp);
+      // Boom-Bus mit Soft-Clipping (Sättigung erzeugt Obertöne = Wucht)
+      const shaper = this.ctx.createWaveShaper();
+      const curve = new Float32Array(1024);
+      for (let i = 0; i < 1024; i++) {
+        curve[i] = Math.tanh(2.5 * (i / 511.5 - 1));
+      }
+      shaper.curve = curve;
+      shaper.oversample = '2x';
+      shaper.connect(this.master);
+      this.boomBus = this.ctx.createGain();
+      this.boomBus.gain.value = 0.9;
+      this.boomBus.connect(shaper);
     } catch (e) { /* kein Audio verfügbar */ }
   },
   now() { return this.ctx.currentTime; },
@@ -212,30 +232,60 @@ const AudioFX = {
     for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
     return buf;
   },
-  // BOOOOOOM — tiefer Sweep + Rausch-Burst, größer = fetter
+  // Brown Noise: tiefenlastiges Rauschen — klingt nach Druckwelle statt Zischen
+  brownNoiseBuffer(dur) {
+    const len = Math.floor(this.ctx.sampleRate * dur);
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < len; i++) {
+      last = (last + 0.02 * (Math.random() * 2 - 1)) / 1.02;
+      d[i] = last * 3.5;
+    }
+    return buf;
+  },
+  // BOOOOOOM — Sub-Bass-Kick + Druckwelle + Knall-Transient, größer = fetter
   boom(size = 1) {
     if (!this.ok()) return;
-    const t = this.now(), dur = 0.35 + size * 0.3;
-    const osc = this.ctx.createOscillator();
-    const og = this.ctx.createGain();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(120 + size * 40, t);
-    osc.frequency.exponentialRampToValueAtTime(28, t + dur);
-    og.gain.setValueAtTime(0.7 + size * 0.15, t);
-    og.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    osc.connect(og).connect(this.master);
-    osc.start(t); osc.stop(t + dur);
-    const noise = this.ctx.createBufferSource();
-    noise.buffer = this.noiseBuffer(dur);
-    const nf = this.ctx.createBiquadFilter();
-    nf.type = 'lowpass';
-    nf.frequency.setValueAtTime(2200, t);
-    nf.frequency.exponentialRampToValueAtTime(120, t + dur);
-    const ng = this.ctx.createGain();
-    ng.gain.setValueAtTime(0.5 + size * 0.2, t);
-    ng.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    noise.connect(nf).connect(ng).connect(this.master);
-    noise.start(t); noise.stop(t + dur);
+    const t = this.now();
+    const vary = 0.9 + Math.random() * 0.2;      // leichte Variation pro Explosion
+    const dur = (0.9 + size * 0.45) * vary;
+    const bus = this.boomBus || this.master;
+    // 1) Sub-Bass-Kick: schneller Pitch-Drop in die Magengrube, rollt tief aus
+    const kick = this.ctx.createOscillator();
+    const kg = this.ctx.createGain();
+    kick.type = 'sine';
+    kick.frequency.setValueAtTime((150 + size * 30) * vary, t);
+    kick.frequency.exponentialRampToValueAtTime(38, t + 0.09);
+    kick.frequency.exponentialRampToValueAtTime(26, t + dur);
+    kg.gain.setValueAtTime(1.15 + size * 0.2, t);
+    kg.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    kick.connect(kg).connect(bus);
+    kick.start(t); kick.stop(t + dur);
+    // 2) Druckwelle: Brown Noise mit absinkendem Lowpass
+    const rumble = this.ctx.createBufferSource();
+    rumble.buffer = this.brownNoiseBuffer(dur);
+    const rf = this.ctx.createBiquadFilter();
+    rf.type = 'lowpass';
+    rf.frequency.setValueAtTime(900 * vary, t);
+    rf.frequency.exponentialRampToValueAtTime(55, t + dur * 0.8);
+    const rg = this.ctx.createGain();
+    rg.gain.setValueAtTime(0.9 + size * 0.35, t);
+    rg.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    rumble.connect(rf).connect(rg).connect(bus);
+    rumble.start(t); rumble.stop(t + dur);
+    // 3) Knall-Transient: kurzer Crack, damit es knallt statt schwillt
+    const crack = this.ctx.createBufferSource();
+    crack.buffer = this.noiseBuffer(0.06);
+    const cf = this.ctx.createBiquadFilter();
+    cf.type = 'bandpass';
+    cf.frequency.value = 1800;
+    cf.Q.value = 0.6;
+    const cg = this.ctx.createGain();
+    cg.gain.setValueAtTime(0.65, t);
+    cg.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+    crack.connect(cf).connect(cg).connect(bus);
+    crack.start(t); crack.stop(t + 0.07);
   },
   bossBoom() {
     if (!this.ok()) return;
